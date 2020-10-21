@@ -1,0 +1,29 @@
+{
+  "name": "cue-backup",
+  "version": "0.1.0",
+  "description": "Backup your favorite aggregator website offline",
+  "main": "backup.js",
+  "scripts": {
+    "backup": "node backup.js",
+    "start": "http-server www -p 8008 -o"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/colinskow/cue-backup.git"
+  },
+  "author": "Colin Skow",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/colinskow/cue-backup/issues"
+  },
+  "homepage": "https://github.com/colinskow/cue-backup#readme",
+  "dependencies": {
+    "@mixmaxhq/promise-pool": "^2.0.0",
+    "fs-extra": "^9.0.1",
+    "http-server": "^0.12.3",
+    "i": "^0.3.6",
+    "npm": "^6.14.8",
+    "puppeteer": "^5.3.1",
+    "tmp-promise": "^3.0.2"
+  }
+}
