@@ -5,10 +5,12 @@ const { URL } = require('url');
 const path = require('path');
 const fse = require('fs-extra');
 const PromisePool = require('@mixmaxhq/promise-pool');
-const { file } = require('tmp-promise');
+const { file: tempFile } = require('tmp-promise');
 
 const DL_CONCURRENCY = 6;
 const DL_THROTTLE = 1000;
+const DL_RETRIES = 3;
+const DL_TIMEOUT = 15000;
 const DEFAULT_SITE_CODED = 'bup.nonaq';
 const BASE_DIR = './www';
 
@@ -37,12 +39,12 @@ async function backup(site) {
   await page.setRequestInterception(true);
 
   page.on('request', (request) => {
-    if (request.url().startsWith('data:') || downloaded.has(request.url())) {
+    if (request.url().startsWith('data:')) {
       return request.continue();
     }
     const urlObj = new URL(request.url());
     const paths = urlObj.pathname.split('/');
-    if (paths[0] === 'data' && paths[1] === 'media') {
+    if (paths[1] === 'data' && paths[2] === 'media') {
       request.abort();
     } else {
       request.continue();
@@ -50,7 +52,11 @@ async function backup(site) {
   });
 
   page.on('response', async (response) => {
-    if (response.url().startsWith('data:')) {
+    if (
+      !response.ok() ||
+      response.url().startsWith('data:') ||
+      downloaded.has(response.url())
+    ) {
       return;
     }
     try {
@@ -69,13 +75,19 @@ async function backup(site) {
     }
   });
 
+  let numErrors = 0;
   try {
-    await savePage(page, site, siteUrl);
+    numErrors += await savePage(page, site, siteUrl);
     const allPostsPage = new URL('/index2.html', site).toString();
-    await savePage(page, allPostsPage, siteUrl)
+    numErrors += await savePage(page, allPostsPage, siteUrl)
     const proofsUrl = new URL('/data/proofs/', site).toString();
-    await saveProofs(page, proofsUrl, siteUrl);
-    console.log('BACKUP COMPLETE! Type `npm start` to launch the web server.');
+    numErrors += await saveProofs(page, proofsUrl, siteUrl);
+    if (numErrors == 0) {
+      console.log('BACKUP COMPLETE! Type `npm start` to launch the web server.');
+    } else {
+      console.log(`[INCOMPLETE] ${numErrors} files failed to download.`);
+      console.log('Check your connection and run the command again.');
+    }
     await browser.close();
   } catch (err) {
     console.error(err);
@@ -88,7 +100,8 @@ async function savePage(page, url, siteUrl) {
     timeout: 30000
   });
   const hrefs = await getImageLinks(page);
-  await downloadAll(hrefs, siteUrl);
+  const numErrors = await downloadAll(hrefs, siteUrl);
+  return numErrors;
 }
 
 async function saveProofs(page, url, siteUrl) {
@@ -97,7 +110,8 @@ async function saveProofs(page, url, siteUrl) {
     timeout: 30000
   });
   const hrefs = await getProofLinks(page);
-  await downloadAll(hrefs, siteUrl);
+  const numErrors = await downloadAll(hrefs, siteUrl);
+  return numErrors;
 }
 
 function getFilePath(url, siteUrl) {
@@ -144,10 +158,7 @@ async function getImageLinks(page) {
   const handles = await page.$$('article a.download');
   const hrefHandles = await Promise.all(handles.map(handle => handle.getProperty('href')));
   const hrefs = await Promise.all(hrefHandles.map(handle => handle.jsonValue()));
-  // Dispose of the handles to avoid memory leaks
-  // [...hrefHandles, ...handles].forEach(handle => handle.dispose());
-  // Deduplicate the array
-  return Array.from(new Set(hrefs));
+  return new Set(hrefs);
 }
 
 async function getProofLinks(page) {
@@ -158,36 +169,47 @@ async function getProofLinks(page) {
   hrefs = hrefs.filter(href => {
     return !!href.match(filterRegex);
   });
-  return Array.from(new Set(hrefs));
+  return new Set(hrefs);
 }
 
 async function downloadAll(links, siteUrl) {
-  const pool = new PromisePool({ numConcurrent: DL_CONCURRENCY });
-  for (link of links) {
-    await pool.start(async (link) => {
-      let dest;
-      try {
-        if (downloaded.has(link)) {
-          return;
-        }
-        downloaded.add(link);
-        dest = getFilePath(new URL(link, siteUrl), siteUrl);
-        const exists = await alreadyExists(dest);
-        if (exists) {
-          return;
-        }
-        const dlPromise = download(link, dest)
-          .then(() => console.log(link));
-        // Add a delay so the server doesn't block us
-        const delayPromise = delay(DL_THROTTLE);
-        await Promise.all([dlPromise, delayPromise]);
-      } catch (err) {
-        console.error('[error]', link);
-        console.error(err);
-      } 
-    }, link);
+  let retries = 0;
+  while (links.size > 0 && retries < DL_RETRIES) {
+    const pool = new PromisePool({ numConcurrent: DL_CONCURRENCY });
+    for (link of links) {
+      await pool.start(async (link) => {
+        let dest;
+        try {
+          if (downloaded.has(link)) {
+            links.delete(link);
+            return;
+          }
+          downloaded.add(link);
+          dest = getFilePath(new URL(link, siteUrl), siteUrl);
+          const exists = await alreadyExists(dest);
+          if (exists) {
+            links.delete(link);
+            return;
+          }
+          const dlPromise = download(link, dest)
+            .then(() => {
+              console.log(link);
+              links.delete(link);
+            });
+          // Add a delay so the server doesn't block us
+          const delayPromise = delay(DL_THROTTLE);
+          await Promise.all([dlPromise, delayPromise]);
+        } catch (err) {
+          console.error('[error]', link);
+          console.error(err);
+        } 
+      }, link);
+    }
+    await pool.flush();
+    retries++;
   }
-  await pool.flush();
+  // Return the number of incomplete files
+  return links.size;
 }
 
 async function alreadyExists(filePath) {
@@ -213,12 +235,12 @@ async function moveFile(src, dest) {
 
 async function download(url, dest) {
   return new Promise(async (resolve, reject) => {
-    const { fd, path: tmpPath, cleanup } = await file();
+    const { fd, path: tmpPath, cleanup } = await tempFile();
     try {
       const tmpFile = fse.createWriteStream(null, { fd });
       const urlObj = new URL(url);
       const agent = urlObj.protocol === 'https' ? https : http;
-      agent.get(url, (response) => {
+      const req = agent.get(url, { timeout: DL_TIMEOUT }, (response) => {
         response.pipe(tmpFile);
         tmpFile.once('error', handleError);
         tmpFile.once('finish', async () => {
@@ -230,7 +252,11 @@ async function download(url, dest) {
             handleError(err);
           }
         });
-      }).once('error', handleError);
+      });
+      req.once('timeout', () => {
+        req.abort();
+      });
+      req.once('error', handleError);
     } catch (err) {
       handleError(err);
     }

@@ -18,7 +18,7 @@
 
 2) Whenever new posts appear you can run the backup command again and it will incrementally download anything new.
 
-3) Once your backup is complete you can type `npm start` into the command prompt to launch the local version of the site. This should automatically open the site a web browser for you.
+3) Once your backup is complete you can type `npm start` into the command prompt to launch the local version of the site. This should automatically open the site in a web browser for you.
 
 4) Press `CTRL-C` inside the terminal window to stop the web server.
 
